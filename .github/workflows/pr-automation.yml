@@ -1,0 +1,368 @@
+name: Pull Request Automation
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          npm run lint -- --format json > eslint-results.json || true
+          echo "ESLINT_OUTPUT=$(cat eslint-results.json)" >> $GITHUB_OUTPUT
+
+      - name: Run Prettier
+        id: prettier
+        run: |
+          npm run prettier -- --check . > prettier-results.txt || true
+          echo "PRETTIER_OUTPUT=$(cat prettier-results.txt)" >> $GITHUB_OUTPUT
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eslintOutput = JSON.parse('${{ steps.eslint.outputs.ESLINT_OUTPUT }}');
+            const prettierOutput = '${{ steps.prettier.outputs.PRETTIER_OUTPUT }}';
+            
+            let eslintIssues = 0;
+            let eslintWarnings = 0;
+            let eslintErrors = 0;
+            
+            if (eslintOutput.length > 0) {
+              eslintOutput.forEach(file => {
+                eslintIssues += file.errorCount + file.warningCount;
+                eslintErrors += file.errorCount;
+                eslintWarnings += file.warningCount;
+              });
+            }
+            
+            const hasPrettierIssues = prettierOutput.includes('Checking') && !prettierOutput.includes('All matched files use Prettier code style!');
+            
+            let commentBody = '## Code Quality Report\n\n';
+            commentBody += '### ESLint Results\n';
+            commentBody += `- Total issues: ${eslintIssues}\n`;
+            commentBody += `- Errors: ${eslintErrors}\n`;
+            commentBody += `- Warnings: ${eslintWarnings}\n\n`;
+            
+            commentBody += '### Prettier Results\n';
+            if (hasPrettierIssues) {
+              commentBody += '❌ Prettier formatting issues found:\n```\n';
+              commentBody += prettierOutput.split('\n').filter(line => line.includes('Checking') || line.includes('error')).join('\n');
+              commentBody += '\n```\n';
+            } else {
+              commentBody += '✅ All files pass Prettier formatting checks!\n';
+            }
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.body.startsWith('## Code Quality Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
+
+  testing-suite:
+    name: Testing Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: tests
+        run: |
+          npm test -- --coverage --coverageReporters=lcov text-summary
+          echo "COVERAGE_SUMMARY=$(cat coverage/lcov-report/index.html | grep -A5 -B5 'total' | grep -E '(statements|branches|functions|lines)' | head -4)" >> $GITHUB_OUTPUT
+          echo "TEST_OUTPUT=$(npm test -- --silent 2>&1 || true)" >> $GITHUB_OUTPUT
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const coverageSummary = '${{ steps.tests.outputs.COVERAGE_SUMMARY }}';
+            const testOutput = '${{ steps.tests.outputs.TEST_OUTPUT }}';
+            
+            let commentBody = '## Test Coverage Report\n\n';
+            commentBody += '### Coverage Summary\n';
+            commentBody += '```\n';
+            commentBody += coverageSummary.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim();
+            commentBody += '\n```\n\n';
+            
+            commentBody += '### Test Results\n';
+            if (testOutput.includes('FAIL')) {
+              commentBody += '❌ Tests failed:\n```\n';
+              commentBody += testOutput.split('\n').filter(line => line.includes('FAIL') || line.includes('✗') || line.includes('Test Suites:') || line.includes('Tests:') || line.includes('Snapshots:') || line.includes('Time:')).join('\n');
+              commentBody += '\n```\n';
+            } else {
+              commentBody += '✅ All tests passed!\n';
+            }
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.body.startsWith('## Test Coverage Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check
+        id: npm-audit
+        run: |
+          npm audit --json > npm-audit.json || true
+          echo "AUDIT_OUTPUT=$(cat npm-audit.json)" >> $GITHUB_OUTPUT
+
+      - name: Scan for secrets
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        with:
+          args: --path=. --no-git --report-format=json --report-path=gitleaks-results.json
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const auditOutput = JSON.parse('${{ steps.npm-audit.outputs.AUDIT_OUTPUT }}');
+            const gitleaksOutput = await fs.readFileSync('gitleaks-results.json', 'utf8').catch(() => '[]');
+            const secrets = JSON.parse(gitleaksOutput);
+            
+            let vulnerabilities = 0;
+            let highSeverity = 0;
+            let moderateSeverity = 0;
+            let lowSeverity = 0;
+            
+            if (auditOutput.advisories) {
+              Object.values(auditOutput.advisories).forEach(advisory => {
+                vulnerabilities++;
+                if (advisory.severity === 'high') highSeverity++;
+                if (advisory.severity === 'moderate') moderateSeverity++;
+                if (advisory.severity === 'low') lowSeverity++;
+              });
+            }
+            
+            let commentBody = '## Security Scan Report\n\n';
+            commentBody += '### Dependencies Vulnerabilities\n';
+            commentBody += `- Total vulnerabilities: ${vulnerabilities}\n`;
+            commentBody += `- High severity: ${highSeverity}\n`;
+            commentBody += `- Moderate severity: ${moderateSeverity}\n`;
+            commentBody += `- Low severity: ${lowSeverity}\n\n`;
+            
+            commentBody += '### Secret Scanning\n';
+            if (secrets.length > 0) {
+              commentBody += '❌ Potential secrets found:\n```\n';
+              secrets.forEach(secret => {
+                commentBody += `- ${secret.RuleID} in ${secret.File}:${secret.Line}\n`;
+              });
+              commentBody += '\n```\n';
+            } else {
+              commentBody += '✅ No secrets found in code changes!\n';
+            }
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.body.startsWith('## Security Scan Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build || true
+          echo "BUILD_OUTPUT=$(npm run build --silent 2>&1 || true)" >> $GITHUB_OUTPUT
+
+      - name: Validate endpoints
+        id: endpoints
+        run: |
+          # Start the application in background
+          npm start &
+          sleep 10
+          
+          # Simple endpoint validation (adjust URLs based on your application)
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000)
+          echo "ENDPOINT_STATUS=${STATUS_CODE}" >> $GITHUB_OUTPUT
+          
+          # Stop the application
+          pkill -f "node" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 7
+
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildOutput = '${{ steps.build.outputs.BUILD_OUTPUT }}';
+            const endpointStatus = '${{ steps.endpoints.outputs.ENDPOINT_STATUS }}';
+            
+            let commentBody = '## Build Validation Report\n\n';
+            
+            commentBody += '### Build Status\n';
+            if (buildOutput.includes('error') || buildOutput.includes('ERR!')) {
+              commentBody += '❌ Build failed:\n```\n';
+              commentBody += buildOutput.split('\n').filter(line => line.includes('error') || line.includes('ERR!') || line.includes('npm ERR!')).join('\n');
+              commentBody += '\n```\n';
+            } else {
+              commentBody += '✅ Build completed successfully!\n';
+            }
+            
+            commentBody += '\n### Endpoint Validation\n';
+            if (endpointStatus === '200') {
+              commentBody += '✅ Main endpoint (http://localhost:3000) is accessible (Status: 200)\n';
+            } else if (endpointStatus) {
+              commentBody += `❌ Main endpoint returned status: ${endpointStatus}\n`;
+            } else {
+              commentBody += '⚠️ Endpoint validation skipped or failed to execute\n';
+            }
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.body.startsWith('## Build Validation Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
